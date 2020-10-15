@@ -5,13 +5,13 @@ use opentelemetry::exporter::trace::{ExportResult, HttpClient};
 use std::fmt::Debug;
 
 #[derive(Debug)]
-pub(crate) enum Uploader {
-    Http(JsonV2Client),
+pub(crate) enum Uploader<C> {
+    Http(JsonV2Client<C>),
 }
 
-impl Uploader {
+impl<C> Uploader<C> {
     /// Create a new http uploader
-    pub(crate) fn new(client: Box<dyn HttpClient>, collector_endpoint: Uri) -> Self {
+    pub(crate) fn new(client: C, collector_endpoint: Uri) -> Self {
         Uploader::Http(JsonV2Client {
             client,
             collector_endpoint,
@@ -30,12 +30,12 @@ impl Uploader {
 }
 
 #[derive(Debug)]
-pub(crate) struct JsonV2Client {
-    client: Box<dyn HttpClient>,
+pub(crate) struct JsonV2Client<C> {
+    client: C,
     collector_endpoint: Uri,
 }
 
-impl JsonV2Client {
+impl<C> JsonV2Client<C> {
     async fn upload(&self, spans: Vec<Span>) -> Result<ExportResult, Box<dyn std::error::Error>> {
         let req = Request::builder()
             .method(Method::POST)

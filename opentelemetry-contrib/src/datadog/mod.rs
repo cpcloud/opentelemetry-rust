@@ -85,19 +85,21 @@
 //!
 //! #[async_trait]
 //! impl HttpClient for IsahcClient {
-//!   async fn send(&self, request: http::Request<Vec<u8>>) -> Result<ExportResult, Box<dyn Error>> {
+//!   type Body = Vec<u8>;
+//!   async fn send(&self, request: http::Request<Self::Body>) -> Result<ExportResult, Box<dyn Error>> {
 //!     let result = self.0.send_async(request).await?;
 //!
-//!     if result.status().is_success() {
-//!       Ok(ExportResult::Success)
+//!     Ok(if result.status().is_success() {
+//!       ExportResult::Success
 //!     } else {
-//!       Ok(ExportResult::FailedNotRetryable)
-//!     }
+//!       ExportResult::FailedNotRetryable
+//!     })
 //!   }
 //! }
 //!
 //! fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let (tracer, _uninstall) = opentelemetry_contrib::datadog::new_pipeline()
+//!     let (tracer, _uninstall) =
+//!     opentelemetry_contrib::datadog::new_pipeline(IsahcClient(isahc::HttpClient::new()))
 //!         .with_service_name("my_app")
 //!         .with_version(opentelemetry_contrib::datadog::ApiVersion::Version05)
 //!         .with_agent_endpoint("http://localhost:8126")
@@ -129,7 +131,6 @@ use opentelemetry::exporter::trace;
 use opentelemetry::exporter::trace::{HttpClient, SpanData};
 use opentelemetry::{api::trace::TracerProvider, global, sdk};
 use std::error::Error;
-use std::io;
 
 /// Default Datadog collector endpoint
 const DEFAULT_AGENT_ENDPOINT: &str = "http://127.0.0.1:8126";
@@ -139,24 +140,16 @@ const DEFAULT_SERVICE_NAME: &str = "OpenTelemetry";
 
 /// Datadog span exporter
 #[derive(Debug)]
-pub struct DatadogExporter {
-    client: Box<dyn HttpClient>,
+pub struct DatadogExporter<C> {
+    client: C,
     request_url: Uri,
     service_name: String,
     version: ApiVersion,
 }
 
-impl DatadogExporter {
-    fn new(
-        service_name: String,
-        agent_endpoint: Uri,
-        version: ApiVersion,
-        client: Box<dyn HttpClient>,
-    ) -> Self {
-        let request_url = agent_endpoint;
-        // request_url.set_path(version.path());
-
-        DatadogExporter {
+impl<C> DatadogExporter<C> {
+    fn new(service_name: String, request_url: Uri, version: ApiVersion, client: C) -> Self {
+        Self {
             client,
             request_url,
             service_name,
@@ -165,96 +158,66 @@ impl DatadogExporter {
     }
 }
 
-/// Create a new Datadog exporter pipeline builder.
-pub fn new_pipeline() -> DatadogPipelineBuilder {
-    DatadogPipelineBuilder::default()
-}
-
 /// Builder for `ExporterConfig` struct.
 #[derive(Debug)]
-pub struct DatadogPipelineBuilder {
+pub struct DatadogPipelineBuilder<C> {
     service_name: String,
     agent_endpoint: String,
     trace_config: Option<sdk::trace::Config>,
     version: ApiVersion,
-    client: Option<Box<dyn HttpClient>>,
+    client: C,
 }
 
-impl Default for DatadogPipelineBuilder {
-    fn default() -> Self {
-        DatadogPipelineBuilder {
+/// Create a new pipeline for Datadog publishing
+pub fn new_pipeline() -> DatadogPipelineBuilder<impl HttpClient> {
+    DatadogPipelineBuilder::new(reqwest::Client::new())
+}
+
+impl<C> DatadogPipelineBuilder<C> {
+    /// Create a new DatadogPipelineBuilder with a particular client
+    pub fn new(client: C) -> Self {
+        Self {
             service_name: DEFAULT_SERVICE_NAME.to_string(),
             agent_endpoint: DEFAULT_AGENT_ENDPOINT.to_string(),
             trace_config: None,
             version: ApiVersion::Version05,
-            #[cfg(all(not(feature = "reqwest"), feature = "surf"))]
-            client: Some(Box::new(surf::Client::new())),
-            #[cfg(all(
-                not(feature = "surf"),
-                not(feature = "reqwest-blocking"),
-                feature = "reqwest"
-            ))]
-            client: Some(Box::new(reqwest::Client::new())),
-            #[cfg(feature = "reqwest-blocking")]
-            client: Some(Box::new(reqwest::blocking::Client::new())),
-            #[cfg(all(
-                not(feature = "reqwest"),
-                not(feature = "reqwest-blocking"),
-                not(feature = "surf"),
-            ))]
-            client: None,
+            client,
         }
     }
-}
 
-impl DatadogPipelineBuilder {
     /// Create `ExporterConfig` struct from current `ExporterConfigBuilder`
-    pub fn install(mut self) -> Result<(sdk::trace::Tracer, Uninstall), Box<dyn Error>> {
-        if let Some(client) = self.client {
-            let endpoint = self.agent_endpoint + self.version.path();
-            let exporter = DatadogExporter::new(
-                self.service_name.clone(),
-                endpoint.parse()?,
-                self.version,
-                client,
-            );
-            let mut provider_builder =
-                sdk::trace::TracerProvider::builder().with_exporter(exporter);
-            if let Some(config) = self.trace_config.take() {
-                provider_builder = provider_builder.with_config(config);
-            }
-            let provider = provider_builder.build();
-            let tracer =
-                provider.get_tracer("opentelemetry-datadog", Some(env!("CARGO_PKG_VERSION")));
-            let provider_guard = global::set_tracer_provider(provider);
-            Ok((tracer, Uninstall(provider_guard)))
-        } else {
-            Err(Box::new(io::Error::new(
-                io::ErrorKind::Other,
-                "http client must be set, users can enable reqwest or surf feature to use http\
-                 client implementation within create",
-            )))
+    pub fn install(
+        mut self,
+    ) -> Result<(sdk::trace::Tracer, Uninstall), Box<dyn Error + Send + Sync + 'static>>
+    where
+        C: HttpClient + std::fmt::Debug + Send + Sync + 'static,
+    {
+        let endpoint = self.agent_endpoint + self.version.path();
+        let exporter = DatadogExporter::new(
+            self.service_name.clone(),
+            endpoint.parse()?,
+            self.version,
+            self.client,
+        );
+        let mut provider_builder = sdk::trace::TracerProvider::builder().with_exporter(exporter);
+        if let Some(config) = self.trace_config.take() {
+            provider_builder = provider_builder.with_config(config);
         }
+        let provider = provider_builder.build();
+        let tracer = provider.get_tracer("opentelemetry-datadog", Some(env!("CARGO_PKG_VERSION")));
+        let provider_guard = global::set_tracer_provider(provider);
+        Ok((tracer, Uninstall(provider_guard)))
     }
 
     /// Assign the service name under which to group traces
-    pub fn with_service_name<T: Into<String>>(mut self, name: T) -> Self {
+    pub fn with_service_name(mut self, name: impl Into<String>) -> Self {
         self.service_name = name.into();
         self
     }
 
     /// Assign the Datadog collector endpoint
-    pub fn with_agent_endpoint<T: Into<String>>(mut self, endpoint: T) -> Self {
+    pub fn with_agent_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.agent_endpoint = endpoint.into();
-        self
-    }
-
-    /// Choose the http client used by uploader
-    pub fn with_http_client<T: HttpClient + 'static>(
-        mut self,
-        client: Box<dyn HttpClient>,
-    ) -> Self {
-        self.client = Some(client);
         self
     }
 
@@ -272,7 +235,7 @@ impl DatadogPipelineBuilder {
 }
 
 #[async_trait]
-impl trace::SpanExporter for DatadogExporter {
+impl<C: HttpClient + std::fmt::Debug + Send + Sync> trace::SpanExporter for DatadogExporter<C> {
     /// Export spans to datadog-agent
     async fn export(&self, batch: Vec<SpanData>) -> trace::ExportResult {
         let data = match self.version.encode(&self.service_name, batch) {

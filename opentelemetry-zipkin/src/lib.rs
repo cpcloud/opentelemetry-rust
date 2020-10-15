@@ -132,7 +132,6 @@ use model::endpoint::Endpoint;
 use opentelemetry::exporter::trace::HttpClient;
 use opentelemetry::{api::trace::TracerProvider, exporter::trace, global, sdk};
 use std::error::Error;
-use std::io;
 use std::net::SocketAddr;
 
 /// Default Zipkin collector endpoint
@@ -143,14 +142,14 @@ const DEFAULT_SERVICE_NAME: &str = "OpenTelemetry";
 
 /// Zipkin span exporter
 #[derive(Debug)]
-pub struct Exporter {
+pub struct Exporter<C> {
     local_endpoint: Endpoint,
-    uploader: uploader::Uploader,
+    uploader: uploader::Uploader<C>,
 }
 
-impl Exporter {
-    fn new(local_endpoint: Endpoint, client: Box<dyn HttpClient>, collector_endpoint: Uri) -> Self {
-        Exporter {
+impl<C> Exporter<C> {
+    fn new(local_endpoint: Endpoint, client: C, collector_endpoint: Uri) -> Self {
+        Self {
             local_endpoint,
             uploader: uploader::Uploader::new(client, collector_endpoint),
         }
@@ -158,88 +157,53 @@ impl Exporter {
 }
 
 /// Create a new Zipkin exporter pipeline builder.
-pub fn new_pipeline() -> ZipkinPipelineBuilder {
-    ZipkinPipelineBuilder::default()
+pub fn new_pipeline() -> ZipkinPipelineBuilder<impl HttpClient> {
+    ZipkinPipelineBuilder::new(reqwest::Client::new())
 }
 
 /// Builder for `ExporterConfig` struct.
 #[derive(Debug)]
-pub struct ZipkinPipelineBuilder {
+pub struct ZipkinPipelineBuilder<C> {
     service_name: String,
     service_addr: Option<SocketAddr>,
     collector_endpoint: String,
     trace_config: Option<sdk::trace::Config>,
-    client: Option<Box<dyn HttpClient>>,
+    client: C,
 }
 
-impl Default for ZipkinPipelineBuilder {
-    fn default() -> Self {
-        ZipkinPipelineBuilder {
-            #[cfg(feature = "reqwest-blocking")]
-            client: Some(Box::new(reqwest::blocking::Client::new())),
-            #[cfg(all(
-                not(feature = "reqwest-blocking"),
-                not(feature = "surf"),
-                feature = "reqwest"
-            ))]
-            client: Some(Box::new(reqwest::Client::new())),
-            #[cfg(all(
-                not(feature = "reqwest"),
-                not(feature = "reqwest-blocking"),
-                feature = "surf"
-            ))]
-            client: Some(Box::new(surf::Client::new())),
-            #[cfg(all(
-                not(feature = "reqwest"),
-                not(feature = "surf"),
-                not(feature = "reqwest-blocking")
-            ))]
-            client: None,
-
+impl<C> ZipkinPipelineBuilder<C> {
+    /// Create a new zipkin pipeline builder
+    pub fn new(client: C) -> Self {
+        Self {
             service_name: DEFAULT_SERVICE_NAME.to_string(),
             service_addr: None,
             collector_endpoint: DEFAULT_COLLECTOR_ENDPOINT.to_string(),
             trace_config: None,
+            client,
         }
     }
-}
-
-impl ZipkinPipelineBuilder {
     /// Create `ExporterConfig` struct from current `ExporterConfigBuilder`
-    pub fn install(mut self) -> Result<(sdk::trace::Tracer, Uninstall), Box<dyn Error>> {
-        if let Some(client) = self.client {
-            let endpoint = Endpoint::new(self.service_name, self.service_addr);
-            let exporter = Exporter::new(endpoint, client, self.collector_endpoint.parse()?);
+    pub fn install(mut self) -> Result<(sdk::trace::Tracer, Uninstall), Box<dyn Error>>
+    where
+        C: HttpClient + std::fmt::Debug + Send + Sync + 'static,
+    {
+        let endpoint = Endpoint::new(self.service_name, self.service_addr);
+        let exporter = Exporter::new(endpoint, self.client, self.collector_endpoint.parse()?);
 
-            let mut provider_builder =
-                sdk::trace::TracerProvider::builder().with_exporter(exporter);
-            if let Some(config) = self.trace_config.take() {
-                provider_builder = provider_builder.with_config(config);
-            }
-            let provider = provider_builder.build();
-            let tracer =
-                provider.get_tracer("opentelemetry-zipkin", Some(env!("CARGO_PKG_VERSION")));
-            let provider_guard = global::set_tracer_provider(provider);
-
-            Ok((tracer, Uninstall(provider_guard)))
-        } else {
-            Err(Box::new(io::Error::new(
-                io::ErrorKind::Other,
-                "http client must be set, users can enable reqwest or surf feature to use http \
-                    client implementation within create",
-            )))
+        let mut provider_builder = sdk::trace::TracerProvider::builder().with_exporter(exporter);
+        if let Some(config) = self.trace_config.take() {
+            provider_builder = provider_builder.with_config(config);
         }
+        let provider = provider_builder.build();
+        let tracer = provider.get_tracer("opentelemetry-zipkin", Some(env!("CARGO_PKG_VERSION")));
+        let provider_guard = global::set_tracer_provider(provider);
+
+        Ok((tracer, Uninstall(provider_guard)))
     }
 
     /// Assign the service name under which to group traces.
-    pub fn with_service_name<T: Into<String>>(mut self, name: T) -> Self {
+    pub fn with_service_name(mut self, name: impl Into<String>) -> Self {
         self.service_name = name.into();
-        self
-    }
-
-    /// Assign client implementation
-    pub fn with_http_client<T: HttpClient + 'static>(mut self, client: T) -> Self {
-        self.client = Some(Box::new(client));
         self
     }
 
@@ -250,7 +214,7 @@ impl ZipkinPipelineBuilder {
     }
 
     /// Assign the Zipkin collector endpoint
-    pub fn with_collector_endpoint<T: Into<String>>(mut self, endpoint: T) -> Self {
+    pub fn with_collector_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.collector_endpoint = endpoint.into();
         self
     }
@@ -263,7 +227,7 @@ impl ZipkinPipelineBuilder {
 }
 
 #[async_trait]
-impl trace::SpanExporter for Exporter {
+impl<C: HttpClient + std::fmt::Debug + Send + Sync> trace::SpanExporter for Exporter<C> {
     /// Export spans to Zipkin collector.
     async fn export(&self, batch: Vec<trace::SpanData>) -> trace::ExportResult {
         let zipkin_spans = batch

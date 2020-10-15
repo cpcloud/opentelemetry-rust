@@ -69,7 +69,7 @@ pub trait SpanExporter: Send + Sync + std::fmt::Debug {
 /// their choice of http clients.
 #[cfg(feature = "http")]
 #[async_trait]
-pub trait HttpClient: Debug + Send + Sync {
+pub trait HttpClient {
     /// Send a batch of spans to collectors
     async fn send(&self, request: Request<Vec<u8>>) -> Result<ExportResult, Box<dyn Error>>;
 }
@@ -114,11 +114,11 @@ impl HttpClient for reqwest::Client {
     async fn send(&self, request: Request<Vec<u8>>) -> Result<ExportResult, Box<dyn Error>> {
         let result = self.execute(request.try_into()?).await?;
 
-        if result.status().is_success() {
-            Ok(ExportResult::Success)
+        Ok(if result.status().is_success() {
+            ExportResult::Success
         } else {
-            Ok(ExportResult::FailedNotRetryable)
-        }
+            ExportResult::FailedNotRetryable
+        })
     }
 }
 
@@ -128,11 +128,11 @@ impl HttpClient for reqwest::blocking::Client {
     async fn send(&self, request: Request<Vec<u8>>) -> Result<ExportResult, Box<dyn Error>> {
         let result = self.execute(request.try_into()?)?;
 
-        if result.status().is_success() {
-            Ok(ExportResult::Success)
+        Ok(if result.status().is_success() {
+            ExportResult::Success
         } else {
-            Ok(ExportResult::FailedNotRetryable)
-        }
+            ExportResult::FailedNotRetryable
+        })
     }
 }
 
@@ -148,11 +148,11 @@ impl HttpClient for surf::Client {
             .body(body);
         let result = self.send(req).await?;
 
-        if result.status().is_success() {
-            Ok(ExportResult::Success)
+        Ok(if result.status().is_success() {
+            ExportResult::Success
         } else {
-            Ok(ExportResult::FailedNotRetryable)
-        }
+            ExportResult::FailedNotRetryable
+        })
     }
 }
 
